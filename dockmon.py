@@ -13,8 +13,11 @@ Run:
 """
 
 import argparse
+import base64
+import hashlib
 import http.client
 import json
+import os
 import socket
 import threading
 import time
@@ -24,6 +27,28 @@ from urllib.parse import parse_qs, urlparse
 
 DOCKER_SOCK = "/var/run/docker.sock"
 API_VERSION = "v1.44"   # minimum supported by recent Docker Engine
+
+# Set by main() from CLI args or DOCKMON_USER / DOCKMON_PASSWORD env vars.
+# Stored as a constant-time-comparable digest so the plaintext never sits in RAM.
+_AUTH_TOKEN: str | None = None   # base64("user:pass") exactly as the client sends
+
+
+def _set_auth(user: str, password: str) -> None:
+    global _AUTH_TOKEN
+    raw = f"{user}:{password}"
+    _AUTH_TOKEN = base64.b64encode(raw.encode()).decode()
+
+
+def _check_auth(handler: "Handler") -> bool:
+    """Return True if the request is authorised (or auth is disabled)."""
+    if _AUTH_TOKEN is None:
+        return True
+    header = handler.headers.get("Authorization", "")
+    if not header.startswith("Basic "):
+        return False
+    provided = header[len("Basic "):]
+    # constant-time comparison to resist timing attacks
+    return hashlib.sha256(provided.encode()).digest() == hashlib.sha256(_AUTH_TOKEN.encode()).digest()
 
 # ---------------------------------------------------------------------------
 # Docker Engine API over the unix socket (stdlib only)
@@ -338,7 +363,23 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj), "application/json")
 
+    def _require_auth(self) -> bool:
+        """Send 401 and return False if the request is not authorised."""
+        if _check_auth(self):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="dockmon"')
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "12")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b"Unauthorized")
+        return False
+
     def do_GET(self):
+        if not self._require_auth():
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -960,13 +1001,25 @@ def main():
     ap = argparse.ArgumentParser(description="dockmon — Docker monitoring dashboard")
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
+    ap.add_argument("--user", default=os.environ.get("DOCKMON_USER", ""),
+                    help="Basic-auth username (env: DOCKMON_USER)")
+    ap.add_argument("--password", default=os.environ.get("DOCKMON_PASSWORD", ""),
+                    help="Basic-auth password (env: DOCKMON_PASSWORD)")
     args = ap.parse_args()
+
+    if args.user and args.password:
+        _set_auth(args.user, args.password)
+        auth_status = f"auth enabled (user: {args.user})"
+    elif args.user or args.password:
+        ap.error("--user and --password must both be set to enable basic auth")
+    else:
+        auth_status = "auth disabled (set --user and --password to enable)"
 
     t = threading.Thread(target=_event_watcher, daemon=True)
     t.start()
 
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
-    print(f"dockmon listening on http://{args.bind}:{args.port}  (API: {API_VERSION})")
+    print(f"dockmon listening on http://{args.bind}:{args.port}  (API: {API_VERSION}, {auth_status})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
