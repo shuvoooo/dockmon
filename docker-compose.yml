@@ -3,7 +3,9 @@ services:
     build: .
     container_name: dockmon
     restart: unless-stopped
-    # ports:
-    #   - "8090:8090"
+    ports:
+      - "8090:8090"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - PYTHONUNBUFFERED=1
